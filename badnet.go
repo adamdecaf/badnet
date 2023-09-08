@@ -49,6 +49,7 @@ func ForTest(t *testing.T, conf Config) *Proxy {
 
 	go func(ctx context.Context, ln net.Listener) {
 		for {
+			// Block while waiting for a connection
 			connCh := make(chan net.Conn)
 			go func() {
 				conn, err := ln.Accept()
@@ -83,50 +84,6 @@ func ForTest(t *testing.T, conf Config) *Proxy {
 			}
 		}
 	}(ctx, ln)
-
-	// p := &Proxy{}
-	// p.proxy.ListenFunc = p.newListener(conf)
-	// p.proxy.AddRoute(conf.Listen, tcpproxy.To(conf.Target))
-	// fmt.Printf("AddRoute: Listen=%q  Target=%q\n", conf.Listen, conf.Target)
-	// // p.proxy.AddSNIRoute(":443", "example.com", tcpproxy.To("example.com:443"))
-
-	// t.Cleanup(func() {
-	// 	err := p.proxy.Close()
-	// 	if err != nil {
-	// 		t.Logf("badnet close: %v", err)
-	// 	}
-	// })
-	// go func() {
-	// 	err := p.proxy.Start()
-	// 	if err != nil {
-	// 		t.Fatalf("badnet run: %v", err)
-	// 	}
-
-	// 	p.proxy.Wait() // a non-nil error is always returned
-	// }()
-
-	// time.Sleep(1 * time.Second)
-
-	// Make an initial connection
-	// _, port, err := net.SplitHostPort(conf.Listen)
-	// if err != nil {
-	// 	t.Fatalf("badnet listen port: %v", err)
-	// }
-
-	// addr := fmt.Sprintf("127.0.0.1:%v", port)
-	// fmt.Printf("test conn on %s\n", p.BindAddr())
-	//
-	// conn, err := net.Dial("tcp", p.BindAddr())
-	// if err != nil {
-	// 	t.Fatalf("badnet test connect: %v", err)
-	// }
-	//
-	// fmt.Printf("LocalAddr=%q\n", conn.LocalAddr().String())
-	// p.bindAddr = conn.LocalAddr().String()
-	// fmt.Printf("RemoteAddr=%q\n", conn.RemoteAddr().String())
-	// p.bindAddr = conn.RemoteAddr().String()
-	//
-	// conn.Close()
 
 	return &p
 }
