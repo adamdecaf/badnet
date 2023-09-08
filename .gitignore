@@ -19,3 +19,8 @@
 
 # Go workspace file
 go.work
+
+# Our test files
+/bin/
+/lint-project.sh
+coverage.txt

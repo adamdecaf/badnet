@@ -47,14 +47,14 @@ func ForTest(t *testing.T, conf Config) *Proxy {
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancelFunc() })
 
-	go func(ctx context.Context, ln net.Listener) {
+	go func(ctx context.Context, ln net.Listener) { //nolint:staticcheck
 		for {
 			// Block while waiting for a connection
 			connCh := make(chan net.Conn)
-			go func() {
+			go func() { //nolint:staticcheck
 				conn, err := ln.Accept()
 				if err != nil {
-					t.Fatalf("badnet listener accept error: %v", err)
+					t.Fatalf("badnet listener accept error: %v", err) //nolint:govet,staticcheck
 					return
 				}
 				connCh <- conn
@@ -69,7 +69,7 @@ func ForTest(t *testing.T, conf Config) *Proxy {
 				// Connect to the target
 				target, err := net.Dial("tcp", conf.Target)
 				if err != nil {
-					t.Fatalf("connecting to %s failed: %v", conf.Target, err)
+					t.Fatalf("connecting to %s failed: %v", conf.Target, err) //nolint:govet,staticcheck
 				}
 
 				// pipe between the listener and target in both directions
