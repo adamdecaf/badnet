@@ -118,7 +118,7 @@ func (c *conn) Read(b []byte) (n int, err error) {
 		partial := len(b) / 2
 		_, err := c.Conn.Read(b[:partial])
 		if err != nil {
-			return partial, err
+			return partial, io.ErrShortWrite
 		}
 		return partial, io.ErrUnexpectedEOF
 	}
@@ -131,7 +131,7 @@ func (c *conn) Write(b []byte) (n int, err error) {
 		partial := len(b) / 2
 		_, err := c.Conn.Write(b[:partial])
 		if err != nil {
-			return partial, err
+			return partial, io.ErrShortWrite
 		}
 		return partial, io.ErrUnexpectedEOF
 	}
