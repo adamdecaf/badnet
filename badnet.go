@@ -27,17 +27,21 @@ type Direction struct {
 }
 
 type Proxy struct {
+	conf Config
+
 	bindAddr string
 }
 
 func ForTest(t *testing.T, conf Config) *Proxy {
 	t.Helper()
 
-	var p Proxy
+	p := &Proxy{
+		conf: conf,
+	}
 	var err error
 
 	// Setup listener
-	ln, err := newListener(conf)
+	ln, err := newListener(p.conf)
 	if err != nil {
 		t.Fatalf("badnet listen failed: %v", err)
 	}
@@ -67,9 +71,9 @@ func ForTest(t *testing.T, conf Config) *Proxy {
 
 			case conn := <-connCh:
 				// Connect to the target
-				target, err := net.Dial("tcp", conf.Target)
+				target, err := net.Dial("tcp", p.conf.Target)
 				if err != nil {
-					t.Fatalf("connecting to %s failed: %v", conf.Target, err) //nolint:govet,staticcheck
+					t.Fatalf("connecting to %s failed: %v", p.conf.Target, err) //nolint:govet,staticcheck
 				}
 
 				// pipe between the listener and target in both directions
@@ -81,11 +85,12 @@ func ForTest(t *testing.T, conf Config) *Proxy {
 				// Cleanup after ourselves
 				target.Close()
 				conn.Close()
+				close(connCh)
 			}
 		}
 	}(ctx, ln)
 
-	return &p
+	return p
 }
 
 func (p *Proxy) BindAddr() string {
@@ -165,12 +170,6 @@ func newListener(conf Config) (net.Listener, error) {
 	ln, err := net.Listen("tcp", conf.Listen)
 	if err != nil {
 		return nil, fmt.Errorf("newListener: %w", err)
-	}
-
-	if (conf.Read.MaxKBps == 0 && conf.Read.Latency == 0*time.Second) ||
-		(conf.Write.MaxKBps == 0 && conf.Write.Latency == 0*time.Second) {
-		// Don't wrap listener with a throttler if it's disabled
-		return ln, nil
 	}
 
 	throttled := &throttle.Listener{
