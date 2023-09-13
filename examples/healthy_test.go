@@ -15,12 +15,13 @@ func TestHealthyNetwork(t *testing.T) {
 	t.Run("HTTP GET", func(t *testing.T) {
 		proxy := badnet.ForTest(t, badnet.Config{
 			Listen: "127.0.0.1:0",
-			Target: "example.com:80",
+			Target: "http://neverssl.com:80",
 		})
 		t.Logf("badnet proxy address: %v", proxy.BindAddr())
 
 		req, err := http.NewRequest("GET", "http://"+proxy.BindAddr(), nil)
 		require.NoError(t, err)
+		req.Header.Set("Accept-Encoding", "text/plain")
 
 		resp, err := http.DefaultClient.Do(req)
 		require.NoError(t, err)
@@ -29,32 +30,33 @@ func TestHealthyNetwork(t *testing.T) {
 		// Loading example.com by its IP gives a 404
 		bs, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
-		require.Contains(t, string(bs), "<h1>404 - Not Found</h1>")
+		require.Contains(t, string(bs), "NeverSSL")
 
 		// Make multiple requests with one proxy
-		for i := 0; i < 5; i++ {
+		for i := 0; i < 3; i++ {
 			resp, err := http.DefaultClient.Do(req)
 			require.NoError(t, err)
-			t.Cleanup(func() { resp.Body.Close() })
 
-			// Loading example.com by its IP gives a 404
 			bs, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
-			require.Contains(t, string(bs), "<h1>404 - Not Found</h1>")
+			require.NoError(t, resp.Body.Close())
+
+			// Check response body
+			require.Contains(t, string(bs), "NeverSSL")
 		}
 	})
 
 	t.Run("throttled", func(t *testing.T) {
 		proxy := badnet.ForTest(t, badnet.Config{
 			Listen: "127.0.0.1:0",
-			Target: "example.com:80",
+			Target: "neverssl.com",
 
 			Read: badnet.Direction{
-				MaxKBps: 1,
+				MaxKBps: 10,
 				Latency: 1 * time.Second,
 			},
 			Write: badnet.Direction{
-				MaxKBps: 1,
+				MaxKBps: 10,
 				Latency: 1 * time.Second,
 			},
 		})
@@ -62,6 +64,7 @@ func TestHealthyNetwork(t *testing.T) {
 
 		req, err := http.NewRequest("GET", "http://"+proxy.BindAddr(), nil)
 		require.NoError(t, err)
+		req.Header.Set("Accept-Encoding", "text/plain")
 
 		start := time.Now()
 		resp, err := http.DefaultClient.Do(req)
@@ -76,6 +79,6 @@ func TestHealthyNetwork(t *testing.T) {
 		// Loading example.com by its IP gives a 404
 		bs, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
-		require.Contains(t, string(bs), "<h1>404 - Not Found</h1>")
+		require.Contains(t, string(bs), "NeverSSL")
 	})
 }

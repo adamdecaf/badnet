@@ -1,12 +1,17 @@
 package badnet
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
+	"net/http"
+	"net/url"
 	"testing"
 	"time"
 
@@ -18,6 +23,30 @@ type Config struct {
 
 	Read  Direction
 	Write Direction
+}
+
+func (c Config) targetAddress() string {
+	host := c.Target
+
+	u, _ := url.Parse(host)
+	if u != nil && u.Host != "" {
+		host = u.Host
+	} else {
+		host = c.Target
+	}
+
+	host, port, _ := net.SplitHostPort(host)
+	if host == "" {
+		if u != nil && u.Host != "" {
+			host = u.Host
+		} else {
+			host = c.Target
+		}
+	}
+	if port == "" {
+		port = "80"
+	}
+	return host + ":" + port
 }
 
 type Direction struct {
@@ -49,6 +78,8 @@ func ForTest(t *testing.T, conf Config) *Proxy {
 
 	// Cycle through connections to proxy traffic
 	ctx, cancelFunc := context.WithCancel(context.Background())
+
+	t.Cleanup(func() { ln.Close() })
 	t.Cleanup(func() { cancelFunc() })
 
 	go func(ctx context.Context, ln net.Listener) { //nolint:staticcheck
@@ -58,7 +89,9 @@ func ForTest(t *testing.T, conf Config) *Proxy {
 			go func() { //nolint:staticcheck
 				conn, err := ln.Accept()
 				if err != nil {
-					t.Fatalf("badnet listener accept error: %v", err) //nolint:govet,staticcheck
+					if !errors.Is(err, net.ErrClosed) {
+						t.Fatalf("badnet listener accept error: %v", err) //nolint:govet,staticcheck
+					}
 					return
 				}
 				connCh <- conn
@@ -71,9 +104,9 @@ func ForTest(t *testing.T, conf Config) *Proxy {
 
 			case conn := <-connCh:
 				// Connect to the target
-				target, err := net.Dial("tcp", p.conf.Target)
+				target, err := net.Dial("tcp", p.conf.targetAddress())
 				if err != nil {
-					t.Fatalf("connecting to %s failed: %v", p.conf.Target, err) //nolint:govet,staticcheck
+					t.Fatalf("connecting to %s failed: %v", p.conf.targetAddress(), err) //nolint:govet,staticcheck
 				}
 
 				// pipe between the listener and target in both directions
@@ -100,6 +133,8 @@ func (p *Proxy) BindAddr() string {
 type conn struct {
 	net.Conn
 
+	targetAddress string
+
 	readFailureRatio  int // 1-100%
 	writeFailureRatio int // 1-100%
 }
@@ -114,6 +149,41 @@ func shouldFail(ratio int) bool {
 }
 
 func (c *conn) Read(b []byte) (n int, err error) {
+	if c.targetAddress != "" {
+		// Our target is accessed with a hostname, so if the request looks like HTTP
+		// we need to make sure that the 'Host' header has the hostname.
+		//
+		// If we send the request with an IP the server won't understand our request.
+		//
+		// TODO(adam): Implement a more generic replacement procedure.
+
+		// Read the HTTP request and replace the header
+		req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(b)))
+		if err != nil {
+			goto read
+		}
+
+		var beforeBuf bytes.Buffer
+		req.Write(&beforeBuf)
+
+		// Replace the Host header with our target
+		host, port, _ := net.SplitHostPort(c.targetAddress)
+		if host != "" {
+			req.Host = host
+		}
+		if port != "" && port != "80" {
+			req.Host += fmt.Sprintf(":%s", port)
+		}
+
+		var afterBuf bytes.Buffer
+		req.Write(&afterBuf)
+
+		// Replace request bytes with updated
+		// TODO(adam): We need a more performant solution...
+		b = bytes.Replace(b, beforeBuf.Bytes(), afterBuf.Bytes(), 1)
+	}
+
+read:
 	if shouldFail(c.readFailureRatio) {
 		partial := len(b) / 2
 		_, err := c.Conn.Read(b[:partial])
@@ -140,7 +210,8 @@ func (c *conn) Write(b []byte) (n int, err error) {
 }
 
 type listener struct {
-	throttled *throttle.Listener
+	throttled     *throttle.Listener
+	targetAddress string
 
 	readFailureRatio  int // 1-100%
 	writeFailureRatio int // 1-100%
@@ -153,6 +224,7 @@ func (l *listener) Accept() (net.Conn, error) {
 	}
 	return &conn{
 		Conn:              c,
+		targetAddress:     l.targetAddress,
 		readFailureRatio:  l.readFailureRatio,
 		writeFailureRatio: l.writeFailureRatio,
 	}, nil
@@ -186,6 +258,7 @@ func newListener(conf Config) (net.Listener, error) {
 
 	return &listener{
 		throttled:         throttled,
+		targetAddress:     conf.targetAddress(),
 		readFailureRatio:  conf.Read.FailureRatio,
 		writeFailureRatio: conf.Write.FailureRatio,
 	}, nil
