@@ -29,3 +29,17 @@ func TestConfig(t *testing.T) {
 		require.Equal(t, "example.com:80", conf.targetAddress())
 	})
 }
+
+func TestProxy(t *testing.T) {
+	t.Run("BindAddr / Port", func(t *testing.T) {
+		proxy := ForTest(t, Config{
+			Listen: "127.0.0.1:0",
+			Target: "www.example.com:80",
+		})
+		t.Logf("badnet proxy address: %v", proxy.BindAddr())
+
+		port := proxy.Port()
+		require.Greater(t, port, 0)
+		require.Less(t, port, 65535)
+	})
+}
