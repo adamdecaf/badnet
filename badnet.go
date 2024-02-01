@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"testing"
 	"time"
 
@@ -128,6 +129,14 @@ func ForTest(t *testing.T, conf Config) *Proxy {
 
 func (p *Proxy) BindAddr() string {
 	return p.bindAddr
+}
+
+func (p *Proxy) Port() int {
+	n, err := strconv.ParseInt(p.BindAddr(), 10, 16)
+	if err != nil {
+		return -1
+	}
+	return int(n)
 }
 
 type conn struct {
