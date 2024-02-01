@@ -1,3 +1,9 @@
+## v0.2.0 (Released 2024-02-01)
+
+IMPROVEMENTS
+
+- feat: add .Port()
+
 ## v0.1.0 (Released 2023-09-11)
 
 IMPROVEMENTS
