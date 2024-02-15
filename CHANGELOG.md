@@ -1,3 +1,9 @@
+## v0.3.0 (Released 2024-02-15)
+
+IMPROVEMENTS
+
+- feat: add FailureRatio() to Proxy for quick stats
+
 ## v0.2.0 (Released 2024-02-01)
 
 IMPROVEMENTS
