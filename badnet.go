@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,6 +62,12 @@ type Proxy struct {
 	conf Config
 
 	bindAddr string
+
+	// various statistics
+	connectionCount atomic.Uint32
+	readFailures    atomic.Uint32
+	writeFailures   atomic.Uint32
+	targetFailures  atomic.Uint32
 }
 
 func ForTest(t *testing.T, conf Config) *Proxy {
@@ -95,6 +103,7 @@ func ForTest(t *testing.T, conf Config) *Proxy {
 					}
 					return
 				}
+				p.connectionCount.Add(1)
 				connCh <- conn
 			}()
 
@@ -107,13 +116,15 @@ func ForTest(t *testing.T, conf Config) *Proxy {
 				// Connect to the target
 				target, err := net.Dial("tcp", p.conf.targetAddress())
 				if err != nil {
+					p.targetFailures.Add(1)
 					t.Fatalf("connecting to %s failed: %v", p.conf.targetAddress(), err) //nolint:govet,staticcheck
+					return
 				}
 
 				// pipe between the listener and target in both directions
 				errCh := make(chan error, 1)
-				go pipe(errCh, conn, target)
-				go pipe(errCh, target, conn)
+				go pipe(errCh, conn, target, &p.readFailures)
+				go pipe(errCh, target, conn, &p.writeFailures)
 				<-errCh
 
 				// Cleanup after ourselves
@@ -141,6 +152,14 @@ func (p *Proxy) Port() int {
 		return -1
 	}
 	return int(n)
+}
+
+// FailureRatio is a ratio of the injected failures and failures to connect with the target
+// against the overall number of connections made to the proxy.
+func (p *Proxy) FailureRatio() float64 {
+	connections := float64(p.connectionCount.Load())
+	failures := float64(p.readFailures.Load() + p.writeFailures.Load() + p.targetFailures.Load())
+	return failures / connections
 }
 
 type conn struct {
@@ -277,9 +296,17 @@ func newListener(conf Config) (net.Listener, error) {
 	}, nil
 }
 
-func pipe(errCh chan error, dst, src io.ReadWriter) {
+func pipe(errCh chan error, dst, src io.ReadWriter, counter *atomic.Uint32) {
+	var count sync.Once
 	for {
 		_, err := io.Copy(dst, src)
+		if err != nil {
+			if !errors.Is(err, net.ErrClosed) {
+				count.Do(func() {
+					counter.Add(1)
+				})
+			}
+		}
 		errCh <- err
 	}
 }

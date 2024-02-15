@@ -1,6 +1,8 @@
 package badnet
 
 import (
+	"context"
+	"net/http"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -41,5 +43,40 @@ func TestProxy(t *testing.T) {
 		port := proxy.Port()
 		require.Greater(t, port, 0)
 		require.Less(t, port, 65535)
+	})
+
+	t.Run("stats", func(t *testing.T) {
+		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("PONG"))
+		})
+		server := &http.Server{
+			Addr:    ":12345",
+			Handler: handler,
+		}
+		go server.ListenAndServe()
+		t.Cleanup(func() {
+			server.Shutdown(context.Background())
+		})
+
+		proxy := ForTest(t, Config{
+			Listen: "127.0.0.1:0",
+			Target: "127.0.0.1:12345",
+			Read:   Direction{FailureRatio: 25},
+			Write:  Direction{FailureRatio: 25},
+		})
+
+		address := "http://" + proxy.BindAddr()
+		t.Logf("badnet proxy address: %v", address)
+
+		for i := 0; i < 100; i++ {
+			resp, _ := http.DefaultClient.Get(address)
+			if resp != nil && resp.Body != nil {
+				resp.Body.Close()
+			}
+		}
+
+		failureRatio := proxy.FailureRatio()
+		require.InDelta(t, failureRatio, 0.5, 0.3)
 	})
 }
