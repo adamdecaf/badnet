@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -53,6 +54,8 @@ func TestProxy(t *testing.T) {
 		server := &http.Server{
 			Addr:    ":12345",
 			Handler: handler,
+
+			ReadHeaderTimeout: 10 * time.Second,
 		}
 		go server.ListenAndServe()
 		t.Cleanup(func() {
