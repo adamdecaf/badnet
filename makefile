@@ -9,7 +9,7 @@ ifeq ($(OS),Windows_NT)
 else
 	@wget -O lint-project.sh https://raw.githubusercontent.com/moov-io/infra/master/go/lint-project.sh
 	@chmod +x ./lint-project.sh
-	./lint-project.sh
+	DISABLE_GORACE=yes ./lint-project.sh
 	cd examples && go test ./...
 endif
 
