@@ -8,11 +8,11 @@ on:
 
 jobs:
   build:
-    name: Go Build
+    name: Examples
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest]
     steps:
     - name: Set up Go 1.x
       uses: actions/setup-go@v5
@@ -23,9 +23,6 @@ jobs:
     - name: Check out code into the Go module directory
       uses: actions/checkout@v4
 
-    - name: Install make (Windows)
-      if: runner.os == 'Windows'
-      run: choco install -y make mingw
-
-    - name: Check
-      run: make check
+    - name: Test
+      run: |
+        cd ./examples/ && go test ./... -count 1 -v
