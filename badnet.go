@@ -1,8 +1,6 @@
 package badnet
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -10,10 +8,8 @@ import (
 	"io"
 	"math/big"
 	"net"
-	"net/http"
 	"net/url"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,47 +19,40 @@ import (
 
 type Config struct {
 	Listen, Target string
-
-	Read  Direction
-	Write Direction
+	Read           Direction
+	Write          Direction
 }
 
 func (c Config) targetAddress() string {
 	host := c.Target
+	port := "80"
 
-	u, _ := url.Parse(host)
-	if u != nil && u.Host != "" {
+	if u, err := url.Parse(c.Target); err == nil && u.Host != "" {
 		host = u.Host
-	} else {
-		host = c.Target
 	}
 
-	host, port, _ := net.SplitHostPort(host)
-	if host == "" {
-		if u != nil && u.Host != "" {
-			host = u.Host
-		} else {
-			host = c.Target
+	if h, p, err := net.SplitHostPort(host); err == nil {
+		host = h
+		if p != "" {
+			port = p
 		}
 	}
-	if port == "" {
-		port = "80"
-	}
-	return host + ":" + port
+
+	return net.JoinHostPort(host, port)
 }
 
 type Direction struct {
-	MaxKBps      int // set 0 for unlimited
+	MaxKBps      int
 	Latency      time.Duration
 	FailureRatio int
 }
 
 type Proxy struct {
-	conf Config
+	conf           Config
+	bindAddr       string
+	listener       net.Listener
+	listenerClosed chan struct{}
 
-	bindAddr string
-
-	// various statistics
 	connectionCount atomic.Uint32
 	readFailures    atomic.Uint32
 	writeFailures   atomic.Uint32
@@ -74,66 +63,55 @@ func ForTest(t *testing.T, conf Config) *Proxy {
 	t.Helper()
 
 	p := &Proxy{
-		conf: conf,
+		conf:           conf,
+		listenerClosed: make(chan struct{}),
 	}
-	var err error
 
-	// Setup listener
 	ln, err := newListener(p.conf)
 	if err != nil {
 		t.Fatalf("badnet listen failed: %v", err)
 	}
+	p.listener = ln
 	p.bindAddr = ln.Addr().String()
 
-	// Cycle through connections to proxy traffic
-	ctx, cancelFunc := context.WithCancel(context.Background())
+	_, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		ln.Close()
+		cancel()
+		<-p.listenerClosed
+	})
 
-	t.Cleanup(func() { ln.Close() })
-	t.Cleanup(func() { cancelFunc() })
-
-	go func(ctx context.Context, ln net.Listener) { //nolint:staticcheck
+	go func() {
+		defer close(p.listenerClosed)
 		for {
-			// Block while waiting for a connection
-			connCh := make(chan net.Conn)
-			go func() { //nolint:staticcheck
-				conn, err := ln.Accept()
-				if err != nil {
-					if !errors.Is(err, net.ErrClosed) {
-						t.Fatalf("badnet listener accept error: %v", err) //nolint:govet,staticcheck
-					}
-					return
+			conn, err := ln.Accept()
+			if err != nil {
+				if !errors.Is(err, net.ErrClosed) {
+					t.Error("badnet listener accept error:", err)
 				}
-				p.connectionCount.Add(1)
-				connCh <- conn
-			}()
-
-			select {
-			case <-ctx.Done():
-				close(connCh)
 				return
+			}
+			p.connectionCount.Add(1)
 
-			case conn := <-connCh:
-				// Connect to the target
+			go func(conn net.Conn) {
+				defer conn.Close()
+
 				target, err := net.Dial("tcp", p.conf.targetAddress())
 				if err != nil {
 					p.targetFailures.Add(1)
-					t.Fatalf("connecting to %s failed: %v", p.conf.targetAddress(), err) //nolint:govet,staticcheck
+					t.Error("connecting to", p.conf.targetAddress(), "failed:", err)
 					return
 				}
+				defer target.Close()
 
-				// pipe between the listener and target in both directions
-				errCh := make(chan error, 1)
+				errCh := make(chan error, 2)
 				go pipe(errCh, conn, target, &p.readFailures)
 				go pipe(errCh, target, conn, &p.writeFailures)
-				<-errCh
 
-				// Cleanup after ourselves
-				target.Close()
-				conn.Close()
-				close(connCh)
-			}
+				<-errCh
+			}(conn)
 		}
-	}(ctx, ln)
+	}()
 
 	return p
 }
@@ -154,99 +132,57 @@ func (p *Proxy) Port() int {
 	return int(n)
 }
 
-// FailureRatio is a ratio of the injected failures and failures to connect with the target
-// against the overall number of connections made to the proxy.
 func (p *Proxy) FailureRatio() float64 {
 	connections := float64(p.connectionCount.Load())
 	failures := float64(p.readFailures.Load() + p.writeFailures.Load() + p.targetFailures.Load())
+	if connections == 0 {
+		return 0
+	}
 	return failures / connections
 }
 
 type conn struct {
 	net.Conn
-
-	targetAddress string
-
-	readFailureRatio  int // 1-100%
-	writeFailureRatio int // 1-100%
+	readFailureRatio  int
+	writeFailureRatio int
 }
 
-var (
-	maxChoice = big.NewInt(int64(100))
-)
+var maxChoice = big.NewInt(100)
 
 func shouldFail(ratio int) bool {
+	if ratio <= 0 {
+		return false
+	}
 	n, _ := rand.Int(rand.Reader, maxChoice)
-	return n.Int64() <= int64(ratio)
+	return n.Int64() < int64(ratio)
 }
 
 func (c *conn) Read(b []byte) (n int, err error) {
-	if c.targetAddress != "" {
-		// Our target is accessed with a hostname, so if the request looks like HTTP
-		// we need to make sure that the 'Host' header has the hostname.
-		//
-		// If we send the request with an IP the server won't understand our request.
-		//
-		// TODO(adam): Implement a more generic replacement procedure.
-
-		// Read the HTTP request and replace the header
-		req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(b)))
-		if err != nil {
-			goto read
-		}
-
-		var beforeBuf bytes.Buffer
-		req.Write(&beforeBuf)
-
-		// Replace the Host header with our target
-		host, port, _ := net.SplitHostPort(c.targetAddress)
-		if host != "" {
-			req.Host = host
-		}
-		if port != "" && port != "80" {
-			req.Host += fmt.Sprintf(":%s", port)
-		}
-
-		var afterBuf bytes.Buffer
-		req.Write(&afterBuf)
-
-		// Replace request bytes with updated
-		// TODO(adam): We need a more performant solution...
-		b = bytes.Replace(b, beforeBuf.Bytes(), afterBuf.Bytes(), 1)
-	}
-
-read:
 	if shouldFail(c.readFailureRatio) {
-		partial := len(b) / 2
-		_, err := c.Conn.Read(b[:partial])
-		if err != nil {
-			return partial, io.ErrShortWrite
+		n, err = c.Conn.Read(b[:len(b)/2])
+		if err == nil {
+			err = io.ErrUnexpectedEOF
 		}
-		return partial, io.ErrUnexpectedEOF
+		return n, err
 	}
-
 	return c.Conn.Read(b)
 }
 
 func (c *conn) Write(b []byte) (n int, err error) {
 	if shouldFail(c.writeFailureRatio) {
-		partial := len(b) / 2
-		_, err := c.Conn.Write(b[:partial])
-		if err != nil {
-			return partial, io.ErrShortWrite
+		n, err = c.Conn.Write(b[:len(b)/2])
+		if err == nil {
+			err = io.ErrUnexpectedEOF
 		}
-		return partial, io.ErrUnexpectedEOF
+		return n, err
 	}
-
 	return c.Conn.Write(b)
 }
 
 type listener struct {
-	throttled     *throttle.Listener
-	targetAddress string
-
-	readFailureRatio  int // 1-100%
-	writeFailureRatio int // 1-100%
+	throttled         *throttle.Listener
+	readFailureRatio  int
+	writeFailureRatio int
 }
 
 func (l *listener) Accept() (net.Conn, error) {
@@ -256,7 +192,6 @@ func (l *listener) Accept() (net.Conn, error) {
 	}
 	return &conn{
 		Conn:              c,
-		targetAddress:     l.targetAddress,
 		readFailureRatio:  l.readFailureRatio,
 		writeFailureRatio: l.writeFailureRatio,
 	}, nil
@@ -290,23 +225,15 @@ func newListener(conf Config) (net.Listener, error) {
 
 	return &listener{
 		throttled:         throttled,
-		targetAddress:     conf.targetAddress(),
 		readFailureRatio:  conf.Read.FailureRatio,
 		writeFailureRatio: conf.Write.FailureRatio,
 	}, nil
 }
 
 func pipe(errCh chan error, dst, src io.ReadWriter, counter *atomic.Uint32) {
-	var count sync.Once
-	for {
-		_, err := io.Copy(dst, src)
-		if err != nil {
-			if !errors.Is(err, net.ErrClosed) {
-				count.Do(func() {
-					counter.Add(1)
-				})
-			}
-		}
-		errCh <- err
+	_, err := io.Copy(dst, src)
+	if err != nil && !errors.Is(err, net.ErrClosed) {
+		counter.Add(1)
 	}
+	errCh <- err
 }
