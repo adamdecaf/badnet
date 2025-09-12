@@ -1,13 +1,13 @@
 module github.com/adamdecaf/badnet/examples
 
-go 1.21.1
+go 1.25.0
 
 replace github.com/adamdecaf/badnet => ../
 
 require (
 	github.com/adamdecaf/badnet v0.0.0-00010101000000-000000000000
 	github.com/gorilla/mux v1.8.0
-	github.com/stretchr/testify v1.10.0
+	github.com/stretchr/testify v1.11.1
 )
 
 require (
