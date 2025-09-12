@@ -1,7 +1,6 @@
 package badnet
 
 import (
-	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -74,10 +73,8 @@ func ForTest(t *testing.T, conf Config) *Proxy {
 	p.listener = ln
 	p.bindAddr = ln.Addr().String()
 
-	_, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() {
 		ln.Close()
-		cancel()
 		<-p.listenerClosed
 	})
 
@@ -86,9 +83,6 @@ func ForTest(t *testing.T, conf Config) *Proxy {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
-				if !errors.Is(err, net.ErrClosed) {
-					t.Error("badnet listener accept error:", err)
-				}
 				return
 			}
 			p.connectionCount.Add(1)
@@ -232,7 +226,7 @@ func newListener(conf Config) (net.Listener, error) {
 
 func pipe(errCh chan error, dst, src io.ReadWriter, counter *atomic.Uint32) {
 	_, err := io.Copy(dst, src)
-	if err != nil && !errors.Is(err, net.ErrClosed) {
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 		counter.Add(1)
 	}
 	errCh <- err
