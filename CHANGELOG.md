@@ -1,20 +1,10 @@
-## v0.5.0 (Unreleased)
+# Changelog
 
-BREAKING
+**Deprecated.** Release notes live on [GitHub Releases](https://github.com/adamdecaf/badnet/releases). This file is kept only for older versions.
 
-- `Read` and `Write` are from the connecting client's point of view
-- `FailureRatio` is per connection, not per Read/Write syscall
-- `Latency` is applied once on the first I/O in that direction
-- Removed `go4.org/net/throttle`; zero-config connections are raw TCP
+## v0.5.0 (Released 2026-08-18)
 
-IMPROVEMENTS
-
-- `https://` and `wss://` targets default to port 443
-- IPv6 targets no longer produce `[[::1]]:80`
-- Both directions are copied to completion; TCP half-close is forwarded
-- Target dial failures increment stats instead of failing the caller test
-- `Config.DialTimeout` (default 5s) when connecting to the target
-- Cleanup waits for in-flight connections
+See the [v0.5.0 release](https://github.com/adamdecaf/badnet/releases/tag/v0.5.0).
 
 ## v0.4.0 (Released 2025-04-17)
 

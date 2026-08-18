@@ -1,6 +1,6 @@
 ## badnet
 
-`badnet` is a TCP proxy for tests. It sits between your application and the service it talks to so you can simulate latency, bandwidth limits, and connection failures without changing application code.
+`badnet` is a TCP proxy for tests. Release notes are on [GitHub Releases](https://github.com/adamdecaf/badnet/releases). It sits between your application and the service it talks to so you can simulate latency, bandwidth limits, and connection failures without changing application code.
 
 1. Start a proxy with `badnet.ForTest`
 2. Point the application at `proxy.BindAddr()`
