@@ -21,10 +21,11 @@ const defaultDialTimeout = 5 * time.Second
 // client's point of view: Read impairs data the client receives, Write
 // impairs data the client sends.
 type Config struct {
-	Listen, Target string
-	Read           Direction
-	Write          Direction
-	DialTimeout    time.Duration
+	Listen      string // local address, e.g. "127.0.0.1:0"
+	Target      string // upstream host:port or URL
+	Read        Direction
+	Write       Direction
+	DialTimeout time.Duration // 0 uses a 5s default
 }
 
 func (c Config) dialTimeout() time.Duration {
@@ -94,6 +95,8 @@ type Proxy struct {
 	targetFailures    atomic.Uint32
 }
 
+// ForTest starts a proxy that shuts down when the test ends.
+// Listen errors fail the test; later target dial errors do not.
 func ForTest(t *testing.T, conf Config) *Proxy {
 	t.Helper()
 
@@ -207,10 +210,12 @@ func (p *Proxy) handle(client net.Conn) {
 	}
 }
 
+// BindAddr is the host:port the application should dial.
 func (p *Proxy) BindAddr() string {
 	return p.bindAddr
 }
 
+// Port is the listening port, or -1 if BindAddr cannot be parsed.
 func (p *Proxy) Port() int {
 	_, port, err := net.SplitHostPort(p.bindAddr)
 	if err != nil {

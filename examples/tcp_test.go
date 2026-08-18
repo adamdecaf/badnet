@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// Concurrent echo through a proxy with latency and per-connection failures.
 func TestConcurrentTCPConnections(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -119,6 +120,49 @@ func TestConcurrentTCPConnections(t *testing.T) {
 
 	elapsed := time.Since(clientStartTime)
 	require.GreaterOrEqual(t, elapsed, 10*time.Millisecond)
+}
+
+// A client CloseWrite is forwarded so the server can reply after EOF.
+func TestHalfClose(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { ln.Close() })
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				body, err := io.ReadAll(c)
+				if err != nil {
+					return
+				}
+				_, _ = c.Write([]byte("got:" + string(body)))
+			}(c)
+		}
+	}()
+
+	proxy := badnet.ForTest(t, badnet.Config{
+		Listen: "127.0.0.1:0",
+		Target: ln.Addr().String(),
+		Read:   badnet.Direction{Latency: time.Millisecond},
+	})
+
+	conn, err := net.DialTimeout("tcp", proxy.BindAddr(), 2*time.Second)
+	require.NoError(t, err)
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	_, err = conn.Write([]byte("ping"))
+	require.NoError(t, err)
+	require.NoError(t, conn.(*net.TCPConn).CloseWrite())
+
+	got, err := io.ReadAll(conn)
+	require.NoError(t, err)
+	require.Equal(t, "got:ping", string(got))
 }
 
 func randomString(n int) string {

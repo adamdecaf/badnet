@@ -12,12 +12,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// Transparent forwarding and one-shot latency / bandwidth limits.
 func TestHealthyNetwork(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("NeverSSL"))
+		_, _ = w.Write([]byte("hello"))
 	})
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go server.Serve(ln)
@@ -42,7 +43,7 @@ func TestHealthyNetwork(t *testing.T) {
 			bs, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
 			require.NoError(t, resp.Body.Close())
-			require.Contains(t, string(bs), "NeverSSL")
+			require.Equal(t, "hello", string(bs))
 		}
 	})
 
@@ -71,6 +72,6 @@ func TestHealthyNetwork(t *testing.T) {
 
 		bs, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
-		require.Contains(t, string(bs), "NeverSSL")
+		require.Equal(t, "hello", string(bs))
 	})
 }
