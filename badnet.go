@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,10 +18,20 @@ import (
 	"go4.org/net/throttle"
 )
 
+const defaultDialTimeout = 5 * time.Second
+
 type Config struct {
 	Listen, Target string
 	Read           Direction
 	Write          Direction
+	DialTimeout    time.Duration
+}
+
+func (c Config) dialTimeout() time.Duration {
+	if c.DialTimeout > 0 {
+		return c.DialTimeout
+	}
+	return defaultDialTimeout
 }
 
 func (c Config) targetAddress() string {
@@ -62,6 +73,11 @@ type Proxy struct {
 	bindAddr       string
 	listener       net.Listener
 	listenerClosed chan struct{}
+	wg             sync.WaitGroup
+	closing        atomic.Bool
+
+	mu    sync.Mutex
+	conns []net.Conn
 
 	connectionCount atomic.Uint32
 	readFailures    atomic.Uint32
@@ -72,53 +88,107 @@ type Proxy struct {
 func ForTest(t *testing.T, conf Config) *Proxy {
 	t.Helper()
 
-	p := &Proxy{
-		conf:           conf,
-		listenerClosed: make(chan struct{}),
-	}
-
-	ln, err := newListener(p.conf)
+	p, err := newProxy(conf)
 	if err != nil {
 		t.Fatalf("badnet listen failed: %v", err)
 	}
-	p.listener = ln
-	p.bindAddr = ln.Addr().String()
 
-	t.Cleanup(func() {
-		ln.Close()
-		<-p.listenerClosed
-	})
+	t.Cleanup(p.shutdown)
+	go p.serve(p.listener)
+	return p
+}
 
-	go func() {
-		defer close(p.listenerClosed)
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			p.connectionCount.Add(1)
+func newProxy(conf Config) (*Proxy, error) {
+	ln, err := newListener(conf)
+	if err != nil {
+		return nil, err
+	}
+	return &Proxy{
+		conf:           conf,
+		listener:       ln,
+		bindAddr:       ln.Addr().String(),
+		listenerClosed: make(chan struct{}),
+	}, nil
+}
 
-			go func(conn net.Conn) {
-				defer conn.Close()
+func (p *Proxy) shutdown() {
+	p.closing.Store(true)
+	if p.listener != nil {
+		p.listener.Close()
+	}
+	<-p.listenerClosed
+	p.mu.Lock()
+	for _, c := range p.conns {
+		_ = c.Close()
+	}
+	p.mu.Unlock()
+	p.wg.Wait()
+}
 
-				target, err := net.Dial("tcp", p.conf.targetAddress())
-				if err != nil {
-					p.targetFailures.Add(1)
-					t.Error("connecting to", p.conf.targetAddress(), "failed:", err)
-					return
+func (p *Proxy) addConn(c net.Conn) {
+	p.mu.Lock()
+	p.conns = append(p.conns, c)
+	p.mu.Unlock()
+}
+
+func (p *Proxy) serve(ln net.Listener) {
+	defer close(p.listenerClosed)
+
+	var delay time.Duration
+	for {
+		accepted, err := ln.Accept()
+		if err != nil {
+			if retryableAccept(err) {
+				if delay == 0 {
+					delay = 5 * time.Millisecond
 				}
-				defer target.Close()
-
-				errCh := make(chan error, 2)
-				go pipe(errCh, conn, target, &p.readFailures)
-				go pipe(errCh, target, conn, &p.writeFailures)
-
-				<-errCh
-			}(conn)
+				time.Sleep(delay)
+				if delay < 80*time.Millisecond {
+					delay *= 2
+				}
+				continue
+			}
+			return
 		}
+		delay = 0
+		p.wg.Add(1)
+		go p.handle(accepted)
+	}
+}
+
+func (p *Proxy) handle(client net.Conn) {
+	defer p.wg.Done()
+	defer client.Close()
+	p.addConn(client)
+
+	p.connectionCount.Add(1)
+	if p.closing.Load() {
+		return
+	}
+
+	target, err := net.DialTimeout("tcp", p.conf.targetAddress(), p.conf.dialTimeout())
+	if err != nil {
+		p.targetFailures.Add(1)
+		return
+	}
+	defer target.Close()
+	p.addConn(target)
+
+	errc := make(chan error, 2)
+	go func() {
+		errc <- copyDir(target, client, &p.writeFailures)
+	}()
+	go func() {
+		errc <- copyDir(client, target, &p.readFailures)
 	}()
 
-	return p
+	err1 := <-errc
+	if err1 != nil && !isBenign(err1) {
+		deadline := time.Now().Add(250 * time.Millisecond)
+		_ = client.SetDeadline(deadline)
+		_ = target.SetDeadline(deadline)
+	}
+	<-errc
 }
 
 func (p *Proxy) BindAddr() string {
@@ -184,6 +254,13 @@ func (c *conn) Write(b []byte) (n int, err error) {
 	return c.Conn.Write(b)
 }
 
+func (c *conn) CloseWrite() error {
+	if cw, ok := c.Conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
 type listener struct {
 	throttled         *throttle.Listener
 	readFailureRatio  int
@@ -235,10 +312,49 @@ func newListener(conf Config) (net.Listener, error) {
 	}, nil
 }
 
-func pipe(errCh chan error, dst, src io.ReadWriter, counter *atomic.Uint32) {
-	_, err := io.Copy(dst, src)
-	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+type closeWriter interface {
+	CloseWrite() error
+}
+
+type readerOnly struct{ io.Reader }
+type writerOnly struct{ io.Writer }
+
+func copyDir(dst, src net.Conn, counter *atomic.Uint32) error {
+	_, err := io.Copy(writerOnly{dst}, readerOnly{src})
+	if err != nil && !isBenign(err) {
 		counter.Add(1)
 	}
-	errCh <- err
+	closeWrite(dst)
+	return err
+}
+
+func closeWrite(c net.Conn) {
+	if cw, ok := c.(closeWriter); ok {
+		_ = cw.CloseWrite()
+	}
+}
+
+func retryableAccept(err error) bool {
+	if err == nil || errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return ne.Timeout() || ne.Temporary()
+	}
+	return false
+}
+
+func isBenign(err error) bool {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	if strings.Contains(err.Error(), "use of closed network connection") {
+		return true
+	}
+	return false
 }
