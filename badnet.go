@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,16 +29,26 @@ func (c Config) targetAddress() string {
 
 	if u, err := url.Parse(c.Target); err == nil && u.Host != "" {
 		host = u.Host
-	}
-
-	if h, p, err := net.SplitHostPort(host); err == nil {
-		host = h
-		if p != "" {
-			port = p
+		switch strings.ToLower(u.Scheme) {
+		case "https", "wss":
+			port = "443"
 		}
 	}
 
-	return net.JoinHostPort(host, port)
+	return joinHostPortDefault(host, port)
+}
+
+func joinHostPortDefault(host, defaultPort string) string {
+	if h, p, err := net.SplitHostPort(host); err == nil {
+		if p != "" {
+			return net.JoinHostPort(h, p)
+		}
+		return net.JoinHostPort(h, defaultPort)
+	}
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
+	return net.JoinHostPort(host, defaultPort)
 }
 
 type Direction struct {

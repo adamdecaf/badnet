@@ -30,6 +30,27 @@ func TestConfig(t *testing.T) {
 
 		conf.Target = "http://example.com"
 		require.Equal(t, "example.com:80", conf.targetAddress())
+
+		conf.Target = "https://example.com"
+		require.Equal(t, "example.com:443", conf.targetAddress())
+
+		conf.Target = "wss://example.com"
+		require.Equal(t, "example.com:443", conf.targetAddress())
+
+		conf.Target = "https://example.com:8443"
+		require.Equal(t, "example.com:8443", conf.targetAddress())
+
+		conf.Target = "[::1]"
+		require.Equal(t, "[::1]:80", conf.targetAddress())
+
+		conf.Target = "[::1]:8080"
+		require.Equal(t, "[::1]:8080", conf.targetAddress())
+
+		conf.Target = "http://[::1]"
+		require.Equal(t, "[::1]:80", conf.targetAddress())
+
+		conf.Target = "https://[::1]"
+		require.Equal(t, "[::1]:443", conf.targetAddress())
 	})
 }
 
