@@ -1,11 +1,10 @@
 package badnet
 
 import (
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
+	"math/rand/v2"
 	"net"
 	"net/url"
 	"strconv"
@@ -14,12 +13,13 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"go4.org/net/throttle"
 )
 
 const defaultDialTimeout = 5 * time.Second
 
+// Config describes a test proxy. Read and Write are from the connecting
+// client's point of view: Read impairs data the client receives, Write
+// impairs data the client sends.
 type Config struct {
 	Listen, Target string
 	Read           Direction
@@ -62,10 +62,18 @@ func joinHostPortDefault(host, defaultPort string) string {
 	return net.JoinHostPort(host, defaultPort)
 }
 
+// Direction impairs one direction of traffic, from the connecting client's
+// point of view. FailureRatio is the percent (0-100) of connections that
+// fail in this direction. Latency is applied once, on the first I/O.
+// MaxKBps of 0 means unlimited.
 type Direction struct {
 	MaxKBps      int
 	Latency      time.Duration
 	FailureRatio int
+}
+
+func (d Direction) active() bool {
+	return d.MaxKBps > 0 || d.Latency > 0 || d.FailureRatio > 0
 }
 
 type Proxy struct {
@@ -79,10 +87,11 @@ type Proxy struct {
 	mu    sync.Mutex
 	conns []net.Conn
 
-	connectionCount atomic.Uint32
-	readFailures    atomic.Uint32
-	writeFailures   atomic.Uint32
-	targetFailures  atomic.Uint32
+	connectionCount   atomic.Uint32
+	failedConnections atomic.Uint32
+	readFailures      atomic.Uint32
+	writeFailures     atomic.Uint32
+	targetFailures    atomic.Uint32
 }
 
 func ForTest(t *testing.T, conf Config) *Proxy {
@@ -99,9 +108,9 @@ func ForTest(t *testing.T, conf Config) *Proxy {
 }
 
 func newProxy(conf Config) (*Proxy, error) {
-	ln, err := newListener(conf)
+	ln, err := net.Listen("tcp", conf.Listen)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("listen: %w", err)
 	}
 	return &Proxy{
 		conf:           conf,
@@ -169,10 +178,13 @@ func (p *Proxy) handle(client net.Conn) {
 	target, err := net.DialTimeout("tcp", p.conf.targetAddress(), p.conf.dialTimeout())
 	if err != nil {
 		p.targetFailures.Add(1)
+		p.failedConnections.Add(1)
 		return
 	}
 	defer target.Close()
 	p.addConn(target)
+
+	client = wrapConn(client, p.conf)
 
 	errc := make(chan error, 2)
 	go func() {
@@ -188,7 +200,11 @@ func (p *Proxy) handle(client net.Conn) {
 		_ = client.SetDeadline(deadline)
 		_ = target.SetDeadline(deadline)
 	}
-	<-errc
+	err2 := <-errc
+
+	if (err1 != nil && !isBenign(err1)) || (err2 != nil && !isBenign(err2)) {
+		p.failedConnections.Add(1)
+	}
 }
 
 func (p *Proxy) BindAddr() string {
@@ -196,7 +212,7 @@ func (p *Proxy) BindAddr() string {
 }
 
 func (p *Proxy) Port() int {
-	_, port, err := net.SplitHostPort(p.BindAddr())
+	_, port, err := net.SplitHostPort(p.bindAddr)
 	if err != nil {
 		return -1
 	}
@@ -207,51 +223,97 @@ func (p *Proxy) Port() int {
 	return int(n)
 }
 
+// FailureRatio is the fraction of accepted connections that had a dial
+// failure or an injected/copy failure.
 func (p *Proxy) FailureRatio() float64 {
 	connections := float64(p.connectionCount.Load())
-	failures := float64(p.readFailures.Load() + p.writeFailures.Load() + p.targetFailures.Load())
 	if connections == 0 {
 		return 0
 	}
-	return failures / connections
+	return float64(p.failedConnections.Load()) / connections
+}
+
+type closeWriter interface {
+	CloseWrite() error
 }
 
 type conn struct {
 	net.Conn
-	readFailureRatio  int
-	writeFailureRatio int
+	toClient       Direction
+	fromClient     Direction
+	failToClient   atomic.Bool
+	failFromClient atomic.Bool
+	toClientOnce   sync.Once
+	fromClientOnce sync.Once
 }
 
-var maxChoice = big.NewInt(100)
+func wrapConn(c net.Conn, conf Config) net.Conn {
+	if !conf.Read.active() && !conf.Write.active() {
+		return c
+	}
+	wc := &conn{
+		Conn:       c,
+		toClient:   conf.Read,
+		fromClient: conf.Write,
+	}
+	if shouldFail(conf.Read.FailureRatio) {
+		wc.failToClient.Store(true)
+	}
+	if shouldFail(conf.Write.FailureRatio) {
+		wc.failFromClient.Store(true)
+	}
+	return wc
+}
 
 func shouldFail(ratio int) bool {
 	if ratio <= 0 {
 		return false
 	}
-	n, _ := rand.Int(rand.Reader, maxChoice)
-	return n.Int64() < int64(ratio)
+	if ratio >= 100 {
+		return true
+	}
+	return rand.IntN(100) < ratio
 }
 
-func (c *conn) Read(b []byte) (n int, err error) {
-	if shouldFail(c.readFailureRatio) {
-		n, err = c.Conn.Read(b[:len(b)/2])
-		if err == nil {
-			err = io.ErrUnexpectedEOF
-		}
-		return n, err
+func (c *conn) Read(b []byte) (int, error) {
+	c.fromClientOnce.Do(func() { sleep(c.fromClient.Latency) })
+	if c.failFromClient.CompareAndSwap(true, false) {
+		return c.partialRead(b)
 	}
-	return c.Conn.Read(b)
+	if c.fromClient.MaxKBps > 0 && len(b) > 1024 {
+		b = b[:1024]
+	}
+	n, err := c.Conn.Read(b)
+	throttle(n, c.fromClient.MaxKBps)
+	return n, err
 }
 
-func (c *conn) Write(b []byte) (n int, err error) {
-	if shouldFail(c.writeFailureRatio) {
-		n, err = c.Conn.Write(b[:len(b)/2])
-		if err == nil {
-			err = io.ErrUnexpectedEOF
-		}
-		return n, err
+func (c *conn) Write(b []byte) (int, error) {
+	c.toClientOnce.Do(func() { sleep(c.toClient.Latency) })
+	if c.failToClient.CompareAndSwap(true, false) {
+		return c.partialWrite(b)
 	}
-	return c.Conn.Write(b)
+	if c.toClient.MaxKBps <= 0 {
+		return c.Conn.Write(b)
+	}
+	var written int
+	for len(b) > 0 {
+		chunk := b
+		if len(chunk) > 1024 {
+			chunk = chunk[:1024]
+		}
+		throttle(len(chunk), c.toClient.MaxKBps)
+		n, err := c.Conn.Write(chunk)
+		written += n
+		if err != nil {
+			return written, err
+		}
+		if n < len(chunk) {
+			return written, io.ErrShortWrite
+		}
+		b = b[n:]
+	}
+	return written, nil
 }
 
 func (c *conn) CloseWrite() error {
@@ -261,61 +323,28 @@ func (c *conn) CloseWrite() error {
 	return nil
 }
 
-type listener struct {
-	throttled         *throttle.Listener
-	readFailureRatio  int
-	writeFailureRatio int
-}
-
-func (l *listener) Accept() (net.Conn, error) {
-	c, err := l.throttled.Accept()
+func (c *conn) partialRead(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	throttle(n, c.fromClient.MaxKBps)
 	if err != nil {
-		return nil, fmt.Errorf("listener.Accept: %w", err)
+		return n, err
 	}
-	return &conn{
-		Conn:              c,
-		readFailureRatio:  l.readFailureRatio,
-		writeFailureRatio: l.writeFailureRatio,
-	}, nil
+	keep := partialLen(n)
+	return keep, io.ErrUnexpectedEOF
 }
 
-func (l *listener) Close() error {
-	return l.throttled.Close()
-}
-
-func (l *listener) Addr() net.Addr {
-	return l.throttled.Addr()
-}
-
-func newListener(conf Config) (net.Listener, error) {
-	ln, err := net.Listen("tcp", conf.Listen)
+func (c *conn) partialWrite(b []byte) (int, error) {
+	chunk := b[:partialLen(len(b))]
+	throttle(len(chunk), c.toClient.MaxKBps)
+	n, err := c.Conn.Write(chunk)
 	if err != nil {
-		return nil, fmt.Errorf("newListener: %w", err)
+		return n, err
 	}
-
-	throttled := &throttle.Listener{
-		Listener: ln,
-		Down: throttle.Rate{
-			KBps:    conf.Read.MaxKBps,
-			Latency: conf.Read.Latency,
-		},
-		Up: throttle.Rate{
-			KBps:    conf.Write.MaxKBps,
-			Latency: conf.Write.Latency,
-		},
-	}
-
-	return &listener{
-		throttled:         throttled,
-		readFailureRatio:  conf.Read.FailureRatio,
-		writeFailureRatio: conf.Write.FailureRatio,
-	}, nil
+	return n, io.ErrShortWrite
 }
 
-type closeWriter interface {
-	CloseWrite() error
-}
-
+// readerOnly / writerOnly hide net.TCPConn's WriteTo/ReadFrom so io.Copy
+// always goes through our Read/Write hooks.
 type readerOnly struct{ io.Reader }
 type writerOnly struct{ io.Writer }
 
@@ -357,4 +386,24 @@ func isBenign(err error) bool {
 		return true
 	}
 	return false
+}
+
+func sleep(d time.Duration) {
+	if d > 0 {
+		time.Sleep(d)
+	}
+}
+
+func throttle(n, kbps int) {
+	if kbps <= 0 || n <= 0 {
+		return
+	}
+	time.Sleep(time.Second * time.Duration(n) / time.Duration(kbps*1024))
+}
+
+func partialLen(n int) int {
+	if n <= 1 {
+		return n
+	}
+	return n / 2
 }
